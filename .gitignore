@@ -10,3 +10,6 @@ dependencies.lock
 .idea/
 .DS_Store
 *.swp
+
+# Engram local project config (nunca subir)
+.engram/

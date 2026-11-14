@@ -13,7 +13,9 @@ phone — no local toolchain required.
 ### What it does
 
 - Prints chip information and the MAC address on boot.
-- Emits a heartbeat (`tick`) every 2 seconds on the serial console.
+- ESP32-S3 acts as an **ESP-NOW hub**: broadcasts `hola` every 2 seconds.
+- ESP32-C3 acts as a **node**: replies `<message> mundo` to the sender, so the
+  hub logs `hola mundo`.
 - Builds one firmware per target from a single source tree.
 
 ### Layout
@@ -83,7 +85,9 @@ Android, sin instalar el *toolchain* en local.
 ### Qué hace
 
 - Muestra la información del chip y la dirección MAC al arrancar.
-- Emite un `tick` cada 2 segundos por la consola serie.
+- La ESP32-S3 actúa como **hub ESP-NOW**: difunde `hola` cada 2 segundos.
+- La ESP32-C3 actúa como **nodo**: responde `<mensaje> mundo` al emisor, así el
+  hub registra `hola mundo`.
 - Compila un firmware por *target* desde un único árbol de código.
 
 ### Estructura
