@@ -1,0 +1,8 @@
+# Secondary console on USB Serial/JTAG so logs are visible over the USB cable.
+CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y
+
+# 4 MiB flash.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# A slightly larger main task stack.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096

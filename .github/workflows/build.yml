@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - key: a
+            target: esp32s3
+          - key: b
+            target: esp32c3
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build (${{ matrix.key }})
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5.6
+          target: ${{ matrix.target }}
+          path: '.'
+          command: 'idf.py build && idf.py merge-bin'
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: out-${{ matrix.key }}
+          if-no-files-found: warn
+          path: |
+            build/merged-flash.bin
+            build/bootloader/bootloader.bin
+            build/partition_table/partition-table.bin
+            build/*.bin
