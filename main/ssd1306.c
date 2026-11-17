@@ -134,6 +134,23 @@ static esp_err_t send_cmd(uint8_t cmd)
     return i2c_master_transmit(s_dev, buf, sizeof(buf), OLED_I2C_TIMEOUT_MS);
 }
 
+/* Diagnostico: recorre el bus y registra que direcciones responden. Solo se
+ * llama cuando el panel esperado no contesta, para no retrasar el arranque
+ * normal (cada sonda sin ACK agota su timeout). */
+static void i2c_scan(void)
+{
+    ESP_LOGW(TAG, "escaneando I2C (SDA=GPIO%d, SCL=GPIO%d)...",
+             OLED_SDA_GPIO, OLED_SCL_GPIO);
+    int found = 0;
+    for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
+        if (i2c_master_probe(s_bus, addr, 20) == ESP_OK) {
+            ESP_LOGW(TAG, "  dispositivo en 0x%02X", addr);
+            found++;
+        }
+    }
+    ESP_LOGW(TAG, "escaneo I2C: %d dispositivo(s)", found);
+}
+
 esp_err_t ssd1306_init(void)
 {
     i2c_master_bus_config_t bus_cfg = {
@@ -154,7 +171,10 @@ esp_err_t ssd1306_init(void)
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = OLED_I2C_ADDR,
-        .scl_speed_hz = 400000,
+        /* 100 kHz en vez de 400 kHz: con solo los pull-ups internos del S3
+         * (y cables Dupont largos) el bus a 400 kHz es marginal y el panel
+         * responde de forma intermitente. */
+        .scl_speed_hz = 100000,
     };
 
     err = i2c_master_bus_add_device(s_bus, &dev_cfg, &s_dev);
@@ -167,6 +187,7 @@ esp_err_t ssd1306_init(void)
     err = i2c_master_probe(s_bus, OLED_I2C_ADDR, OLED_I2C_TIMEOUT_MS);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "no OLED at 0x%02X: %s", OLED_I2C_ADDR, esp_err_to_name(err));
+        i2c_scan();
         return err;
     }
 
