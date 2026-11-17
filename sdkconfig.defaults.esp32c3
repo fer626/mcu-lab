@@ -1,0 +1,6 @@
+# ESP32-C3 dev boards (SuperMini, DevKitM-1, ...) expose the console over the
+# built-in USB-Serial-JTAG peripheral instead of a UART bridge chip. Making it
+# the primary console lets the `name` command read from the same USB port used
+# to flash and monitor the board.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=n

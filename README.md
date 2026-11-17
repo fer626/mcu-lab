@@ -13,10 +13,53 @@ phone — no local toolchain required.
 ### What it does
 
 - Prints chip information and the MAC address on boot.
-- ESP32-S3 acts as an **ESP-NOW hub**: broadcasts `hola` every 2 seconds.
-- ESP32-C3 acts as a **node**: replies `<message> mundo` to the sender, so the
-  hub logs `hola mundo`.
+- ESP32-S3 acts as an **ESP-NOW hub**: broadcasts `hola` every 10 seconds and
+  shows, on a 128x64 I2C OLED, the name of every node that answers together
+  with the message it sent.
+- ESP32-C3 acts as a **node**: replies `<message> mundo` tagged with its name.
+  The name defaults to `c3-XXXX` (last two bytes of the STA MAC) and can be
+  changed from the serial console.
 - Builds one firmware per target from a single source tree.
+
+### Wiring (OLED on the ESP32-S3)
+
+The hub drives an **SSD1306/SH1106 128x64 I2C OLED**:
+
+| OLED | ESP32-S3-DevKitC-1 |
+|------|--------------------|
+| VCC  | 3V3                |
+| GND  | GND                |
+| SDA  | GPIO8              |
+| SCL  | GPIO9              |
+
+I2C address `0x3C` (some modules use `0x3D`). Pins, address, panel size and the
+broadcast period live in [`main/board.h`](main/board.h) — change them there if
+your wiring differs. If no panel answers on the bus, the hub keeps working and
+just logs to the console. The display shows up to four nodes (most recent
+first); each line fits 21 characters.
+
+### Naming a node
+
+Every ESP32-C3 shows up as `c3-XXXX`, where `XXXX` are the last two bytes of its
+MAC, so boards are distinguishable with no setup. To give one a friendly name,
+open its serial console (115200 baud) and type:
+
+```
+name cocina
+```
+
+The name is saved in NVS and survives reboots. `name` with no arguments prints
+the current name; `name -` restores the MAC default. On the ESP32-C3 the console
+is the built-in USB-Serial-JTAG port (see `sdkconfig.defaults.esp32c3`), so you
+can use the same USB cable you flash with.
+
+### Heat and range
+
+ESP-NOW keeps the radio listening, so the node's receiver stays on and the
+module will feel warm. This demo keeps that cost low by broadcasting every 10 s
+(`SEND_PERIOD_MS`) and lowering TX power to 8.5 dBm (`TX_POWER_QDBM`). Increase
+`SEND_PERIOD_MS` to send even less often; raise `TX_POWER_QDBM` (up to ~78 =
+20 dBm) if you need more range. Both live in [`main/board.h`](main/board.h).
 
 ### Layout
 
@@ -24,9 +67,13 @@ phone — no local toolchain required.
 .
 ├── CMakeLists.txt
 ├── sdkconfig.defaults
+├── sdkconfig.defaults.esp32c3
 ├── main/
 │   ├── CMakeLists.txt
-│   └── main.c
+│   ├── board.h        # pin map and tunables
+│   ├── main.c         # hub (S3) and node (C3) roles
+│   ├── ssd1306.c      # tiny SSD1306 I2C driver + 5x7 font
+│   └── ssd1306.h
 └── .github/workflows/build.yml
 ```
 
@@ -85,10 +132,56 @@ Android, sin instalar el *toolchain* en local.
 ### Qué hace
 
 - Muestra la información del chip y la dirección MAC al arrancar.
-- La ESP32-S3 actúa como **hub ESP-NOW**: difunde `hola` cada 2 segundos.
-- La ESP32-C3 actúa como **nodo**: responde `<mensaje> mundo` al emisor, así el
-  hub registra `hola mundo`.
+- La ESP32-S3 actúa como **hub ESP-NOW**: difunde `hola` cada 10 segundos y
+  muestra en una OLED I2C de 128x64 el nombre de cada nodo que responde junto
+  con el mensaje que envió.
+- La ESP32-C3 actúa como **nodo**: responde `<mensaje> mundo` etiquetado con su
+  nombre. El nombre por defecto es `c3-XXXX` (los dos últimos bytes de la MAC
+  STA) y se puede cambiar por la consola serie.
 - Compila un firmware por *target* desde un único árbol de código.
+
+### Conexión (OLED en la ESP32-S3)
+
+El hub controla una **OLED SSD1306/SH1106 de 128x64 por I2C**:
+
+| OLED | ESP32-S3-DevKitC-1 |
+|------|--------------------|
+| VCC  | 3V3                |
+| GND  | GND                |
+| SDA  | GPIO8              |
+| SCL  | GPIO9              |
+
+Dirección I2C `0x3C` (algunos módulos usan `0x3D`). Los pines, la dirección, el
+tamaño del panel y el periodo de difusión están en
+[`main/board.h`](main/board.h) — cámbialos ahí si tu cableado es distinto. Si no
+hay panel en el bus, el hub sigue funcionando y solo escribe en la consola. La
+pantalla muestra hasta cuatro nodos (el más reciente primero); cada línea cabe
+en 21 caracteres.
+
+### Ponerle nombre a un nodo
+
+Cada ESP32-C3 aparece como `c3-XXXX`, donde `XXXX` son los dos últimos bytes de
+su MAC, así que se distinguen sin configurar nada. Para darle un nombre humano,
+abre su consola serie (115200 baudios) y escribe:
+
+```
+name cocina
+```
+
+El nombre se guarda en NVS y sobrevive a los reinicios. `name` sin argumentos
+muestra el nombre actual; `name -` restaura el valor por defecto de la MAC. En
+la ESP32-C3 la consola es el puerto USB-Serial-JTAG integrado (ver
+`sdkconfig.defaults.esp32c3`), así que puedes usar el mismo cable USB con el que
+flasheas.
+
+### Calor y alcance
+
+ESP-NOW mantiene la radio escuchando, así que el receptor del nodo queda
+encendido y el módulo se nota caliente. Este ejemplo lo reduce difundiendo cada
+10 s (`SEND_PERIOD_MS`) y bajando la potencia de TX a 8.5 dBm (`TX_POWER_QDBM`).
+Sube `SEND_PERIOD_MS` para enviar aún menos; sube `TX_POWER_QDBM` (hasta ~78 =
+20 dBm) si necesitas más alcance. Ambos están en
+[`main/board.h`](main/board.h).
 
 ### Estructura
 
@@ -96,9 +189,13 @@ Android, sin instalar el *toolchain* en local.
 .
 ├── CMakeLists.txt
 ├── sdkconfig.defaults
+├── sdkconfig.defaults.esp32c3
 ├── main/
 │   ├── CMakeLists.txt
-│   └── main.c
+│   ├── board.h        # mapa de pines y ajustes
+│   ├── main.c         # roles hub (S3) y nodo (C3)
+│   ├── ssd1306.c      # driver mínimo SSD1306 por I2C + fuente 5x7
+│   └── ssd1306.h
 └── .github/workflows/build.yml
 ```
 
