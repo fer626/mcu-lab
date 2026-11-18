@@ -1,16 +1,18 @@
 /*
- * app - ESP-NOW "hello" demo with an OLED hub
+ * app - ESP-NOW "hello/mundo" demo con mensajes AUTENTICADOS y CIFRADOS
  *
- * ESP32-S3 (hub)  : broadcasts "hola" every SEND_PERIOD_MS and shows, on an
- *                   SSD1306 I2C OLED, the name of every node that answers
- *                   together with the full message it sent.
- * ESP32-C3 (node) : replies "<received> mundo" tagged with its name. The name
- *                   defaults to "c3-XXXX" (last two bytes of the STA MAC) and
- *                   can be overridden from the serial console with `name`.
+ * Capa 1 (enlace): ESP-NOW con PMK global + LMK por par cuando la MAC del peer
+ *                  esta registrada en secrets.h. En modo prueba el hub acepta
+ *                  cualquier MAC autenticada y el peer se registra dinamicamente.
+ * Capa 2 (app):    AES-128-GCM (mbedTLS 3.x) con AAD sobre la cabecera, seq y
+ *                  anti-replay. Es la que garantiza confidencialidad y que un
+ *                  C3 ajeno no pueda suplantar a otro.
  *
- * No Wi-Fi AP, router or credentials are needed. Both boards use ESP-NOW on a
- * fixed channel. The hub talks to the broadcast address, so no MAC has to be
- * hard-coded; the node answers to the source address it sees.
+ * ESP32-S3 (hub)  : envia "hola" por ESP-NOW y muestra en el OLED el nombre y
+ *                  mensaje de cada nodo que responde. Solo muestra mensajes
+ *                  cuyo tag GCM es valido y cuyo seq es nuevo.
+ * ESP32-C3 (nodo) : responde "<recibido> mundo" cifrado con su clave de rol.
+ *                  El nombre por defecto es c3-XXXX y se cambia con `name`.
  */
 #include <stdbool.h>
 #include <stdio.h>
@@ -29,6 +31,7 @@
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_now.h"
+#include "esp_random.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -36,21 +39,25 @@
 #include "nvs_flash.h"
 
 #include "board.h"
+#include "crypto.h"
+#include "protocol.h"
 #include "ssd1306.h"
+
+#if __has_include("secrets.h")
+#include "secrets.h"
+#define USING_DEV_KEYS 0
+#else
+#include "secrets_dev.h"
+#define USING_DEV_KEYS 1
+#endif
 
 #define RX_QUEUE_LEN   4
 #define NEKO_NAME_LEN  24
-#define NEKO_TEXT_LEN  200
-#define NEKO_MAGIC     0x4E   /* 'N' */
+
+#define MSG_HELLO      1
+#define MSG_REPLY      2
 
 static const char *TAG = "app";
-
-/* Wire format of a node -> hub message. */
-typedef struct __attribute__((packed)) {
-    uint8_t magic;
-    char    name[NEKO_NAME_LEN];
-    char    text[NEKO_TEXT_LEN];
-} node_msg_t;
 
 typedef struct {
     uint8_t src[6];
@@ -71,6 +78,34 @@ static void copy_str(char *dst, size_t dst_size, const char *src)
     }
     memcpy(dst, src, n);
     dst[n] = '\0';
+}
+
+static const uint8_t *key_for_node(uint8_t id)
+{
+    switch (id) {
+        case NODE_TINACO:   return K_TINACO;
+        case NODE_CISTERNA: return K_CISTERNA;
+        case NODE_BOMBA:    return K_BOMBA;
+        default:            return NULL;
+    }
+}
+
+static const uint8_t *lmk_for_node(uint8_t id)
+{
+    switch (id) {
+        case NODE_TINACO:   return LMK_TINACO;
+        case NODE_CISTERNA: return LMK_CISTERNA;
+        case NODE_BOMBA:    return LMK_BOMBA;
+        default:            return NULL;
+    }
+}
+
+static bool mac_is_zero(const uint8_t mac[6])
+{
+    for (int i = 0; i < 6; i++) {
+        if (mac[i] != 0) return false;
+    }
+    return true;
 }
 
 static void nvs_init(void)
@@ -104,6 +139,12 @@ static void log_boot_info(void)
     ESP_LOGI(TAG, "  MAC (STA)   : " MACSTR, MAC2STR(mac));
     ESP_LOGI(TAG, "  idf         : %s", esp_get_idf_version());
     ESP_LOGI(TAG, "  free heap   : %u bytes", (unsigned)esp_get_free_heap_size());
+    ESP_LOGI(TAG, "  crypto      : AES-128-GCM + AAD + seq (mbedTLS)");
+#if USING_DEV_KEYS
+    ESP_LOGW(TAG, "  KEYS        : DEV (inseguras) - configura GitHub Secrets");
+#else
+    ESP_LOGI(TAG, "  KEYS        : reales (secrets.h)");
+#endif
 #if CONFIG_IDF_TARGET_ESP32S3
     ESP_LOGI(TAG, "  oled        : SSD1306 %dx%d @0x%02X (SDA=GPIO%d, SCL=GPIO%d)",
              OLED_WIDTH, OLED_HEIGHT, OLED_I2C_ADDR, OLED_SDA_GPIO, OLED_SCL_GPIO);
@@ -127,7 +168,6 @@ static void wifi_init(void)
     /* ESP-NOW needs the radio listening, so keep power save off. */
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_ERROR_CHECK(esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
-    /* Lower TX power: less current, less heat. */
     ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(TX_POWER_QDBM));
 }
 
@@ -147,14 +187,16 @@ typedef struct {
 
 static const uint8_t s_broadcast[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 static node_entry_t s_nodes[MAX_NODES];
+static uint32_t s_last_seq[NODE_COUNT];
 static bool s_oled_ok;
+static bool s_link_encryption;
 
 static void hub_render(void);
 
 static void hub_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t status)
 {
     (void)tx_info;
-    ESP_LOGI(TAG, "TX -> broadcast: %s",
+    ESP_LOGD(TAG, "TX -> broadcast: %s",
              status == ESP_NOW_SEND_SUCCESS ? "ok" : "failed");
 }
 
@@ -168,6 +210,37 @@ static void hub_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, in
     if (xQueueSend(s_rx_queue, &pkt, 0) != pdTRUE) {
         ESP_LOGW(TAG, "RX queue full, dropping packet");
     }
+}
+
+/* Registra al peer con su LMK para cifrar tambien la capa de enlace.
+ * En modo prueba (MAC en cero) no se conoce la MAC de antemano, asi que el
+ * peer se da de alta dinamicamente y la capa 2 (GCM) es la que protege. */
+static bool hub_ensure_peer(const uint8_t mac[6], uint8_t node_id)
+{
+    if (esp_now_is_peer_exist(mac)) {
+        return true;
+    }
+    if (!s_link_encryption) {
+        return true;   /* modo prueba: GCM protege el payload */
+    }
+
+    const uint8_t *lmk = lmk_for_node(node_id);
+    if (lmk == NULL) return false;
+
+    esp_now_peer_info_t peer = { 0 };
+    memcpy(peer.peer_addr, mac, 6);
+    memcpy(peer.lmk, lmk, ESP_NOW_KEY_LEN);
+    peer.channel = ESPNOW_CHANNEL;
+    peer.ifidx = WIFI_IF_STA;
+    peer.encrypt = true;
+
+    esp_err_t err = esp_now_add_peer(&peer);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "could not add peer " MACSTR ": %s",
+                 MAC2STR(mac), esp_err_to_name(err));
+        return false;
+    }
+    return true;
 }
 
 static node_entry_t *hub_find_or_add(const uint8_t mac[6])
@@ -192,20 +265,49 @@ static node_entry_t *hub_find_or_add(const uint8_t mac[6])
 
 static void hub_handle_rx(const rx_packet_t *pkt)
 {
-    node_msg_t m = { 0 };
-    int n = pkt->len;
-    if (n > (int)sizeof(m)) {
-        n = sizeof(m);
-    }
-    memcpy(&m, pkt->data, n);
-
-    if (m.magic != NEKO_MAGIC) {
-        ESP_LOGW(TAG, "RX <- " MACSTR ": bad magic 0x%02X",
-                 MAC2STR(pkt->src), m.magic);
+    secure_msg_t m;
+    if (pkt->len != (int)sizeof(m)) {
+        ESP_LOGW(TAG, "RX <- " MACSTR ": bad length %d (want %u)",
+                 MAC2STR(pkt->src), pkt->len, (unsigned)sizeof(m));
         return;
     }
-    m.name[NEKO_NAME_LEN - 1] = '\0';
-    m.text[NEKO_TEXT_LEN - 1] = '\0';
+    memcpy(&m, pkt->data, sizeof(m));
+
+    if (m.magic != 'N' || m.type != MSG_REPLY || m.dst != NODE_HUB) {
+        ESP_LOGW(TAG, "RX <- " MACSTR ": bad header (magic=0x%02X type=%u dst=%u)",
+                 MAC2STR(pkt->src), m.magic, m.type, m.dst);
+        return;
+    }
+    if (m.src == NODE_HUB || m.src >= NODE_COUNT) {
+        ESP_LOGW(TAG, "RX <- " MACSTR ": bad src %u", MAC2STR(pkt->src), m.src);
+        return;
+    }
+
+    const uint8_t *key = key_for_node(m.src);
+    if (key == NULL) {
+        ESP_LOGW(TAG, "RX <- " MACSTR ": no key for src %u", MAC2STR(pkt->src), m.src);
+        return;
+    }
+
+    /* Anti-replay: se descarta cualquier seq ya visto para ese nodo. */
+    if (m.seq <= s_last_seq[m.src]) {
+        ESP_LOGW(TAG, "RX <- " MACSTR ": replay seq=%u (last=%u)",
+                 MAC2STR(pkt->src), (unsigned)m.seq, (unsigned)s_last_seq[m.src]);
+        return;
+    }
+
+    plain_t plain;
+    size_t plain_len = 0;
+    if (crypto_open(key, &m, &plain, &plain_len) != ESP_OK) {
+        ESP_LOGW(TAG, "RX <- " MACSTR ": AUTH FAILED src=%u seq=%u (descartado)",
+                 MAC2STR(pkt->src), m.src, (unsigned)m.seq);
+        return;   /* tag invalido: no se muestra en el OLED */
+    }
+
+    if (!hub_ensure_peer(pkt->src, m.src)) {
+        return;
+    }
+    s_last_seq[m.src] = m.seq;
 
     node_entry_t *e = hub_find_or_add(pkt->src);
     if (e == NULL) {
@@ -213,12 +315,14 @@ static void hub_handle_rx(const rx_packet_t *pkt)
         return;
     }
 
-    copy_str(e->name, sizeof(e->name), m.name);
-    copy_str(e->text, sizeof(e->text), m.text);
+    plain.name[NEKO_NAME_LEN - 1] = '\0';
+    plain.text[NEKO_TEXT_LEN - 1] = '\0';
+    copy_str(e->name, sizeof(e->name), plain.name);
+    copy_str(e->text, sizeof(e->text), plain.text);
     e->last_seen_us = esp_timer_get_time();
 
-    ESP_LOGI(TAG, "RX <- %s (" MACSTR "): \"%s\"",
-             e->name, MAC2STR(pkt->src), e->text);
+    ESP_LOGI(TAG, "AUTH OK <- %s (" MACSTR ") seq=%u: \"%s\"",
+             e->name, MAC2STR(pkt->src), (unsigned)m.seq, e->text);
 
     hub_render();
 }
@@ -263,8 +367,8 @@ static void hub_render(void)
 
 static void hub_broadcast(const char *msg)
 {
-    esp_err_t err = esp_now_send(s_broadcast, (const uint8_t *)msg,
-                                 strlen(msg) + 1);
+    /* El "hola" es publico: solo dispara la respuesta cifrada del nodo. */
+    esp_err_t err = esp_now_send(s_broadcast, (const uint8_t *)msg, strlen(msg) + 1);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "send failed: %s", esp_err_to_name(err));
     }
@@ -283,7 +387,7 @@ static void hub_task(void *arg)
 
         TickType_t now = xTaskGetTickCount();
         if (now - last_send >= pdMS_TO_TICKS(SEND_PERIOD_MS)) {
-            ESP_LOGI(TAG, "TX -> broadcast: \"hola\"");
+            ESP_LOGI(TAG, "TX -> broadcast: \"hola\" (trigger, sin datos)");
             hub_broadcast("hola");
             last_send = now;
         }
@@ -293,7 +397,10 @@ static void hub_task(void *arg)
 #elif CONFIG_IDF_TARGET_ESP32C3
 /* ------------------------------- node ----------------------------------- */
 
+#define NODE_ROLE_ID NODE_TINACO   /* modo prueba: un solo C3 con clave de tinaco */
+
 static char s_name[NEKO_NAME_LEN];
+static uint32_t s_seq;
 
 static void node_name_from_mac(char *out, size_t n)
 {
@@ -316,7 +423,28 @@ static void node_name_load(void)
         node_name_from_mac(s_name, sizeof(s_name));
     }
 
-    ESP_LOGI(TAG, "node name: %s", s_name);
+    s_seq = 0;
+    if (nvs_open("node", NVS_READONLY, &h) == ESP_OK) {
+        uint32_t stored = 0;
+        size_t slen = sizeof(stored);
+        if (nvs_get_u32(h, "seq", &stored) == ESP_OK && slen == sizeof(stored)) {
+            s_seq = stored;
+        }
+        nvs_close(h);
+    }
+
+    ESP_LOGI(TAG, "node name: %s | role=%u | seq=%u", s_name, NODE_ROLE_ID,
+             (unsigned)s_seq);
+}
+
+static void node_seq_save(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("node", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u32(h, "seq", s_seq);
+        nvs_commit(h);
+        nvs_close(h);
+    }
 }
 
 static int cmd_name(int argc, char **argv)
@@ -419,10 +547,31 @@ static void node_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, i
     }
 }
 
+static bool node_add_peer(const uint8_t mac[6])
+{
+    if (esp_now_is_peer_exist(mac)) {
+        return true;
+    }
+    esp_now_peer_info_t peer = { 0 };
+    memcpy(peer.peer_addr, mac, sizeof(peer.peer_addr));
+    peer.channel = ESPNOW_CHANNEL;
+    peer.ifidx = WIFI_IF_STA;
+    peer.encrypt = false;   /* modo prueba: no conocemos la LMK del hub */
+
+    esp_err_t err = esp_now_add_peer(&peer);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "could not add peer " MACSTR ": %s",
+                 MAC2STR(mac), esp_err_to_name(err));
+        return false;
+    }
+    return true;
+}
+
 static void node_task(void *arg)
 {
     (void)arg;
     rx_packet_t pkt;
+    const uint8_t *key = key_for_node(NODE_ROLE_ID);
 
     while (1) {
         if (xQueueReceive(s_rx_queue, &pkt, portMAX_DELAY) != pdTRUE) {
@@ -434,36 +583,39 @@ static void node_task(void *arg)
         memcpy(text, pkt.data, n);
         text[n] = '\0';
 
-        /* Build "<received> mundo" and tag it with this node's name. */
-        node_msg_t reply = { 0 };
-        reply.magic = NEKO_MAGIC;
-        copy_str(reply.name, sizeof(reply.name), s_name);
+        /* Solo respondemos al disparo publico del hub. */
+        if (strcmp(text, "hola") != 0) {
+            ESP_LOGD(TAG, "ignore non-hello frame (%d bytes)", pkt.len);
+            continue;
+        }
+        if (key == NULL || !node_add_peer(pkt.src)) {
+            continue;
+        }
+
+        plain_t plain;
+        memset(&plain, 0, sizeof(plain));
+        copy_str(plain.name, sizeof(plain.name), s_name);
 
         const char suffix[] = " mundo";
         size_t tlen = strlen(text);
-        if (tlen > sizeof(reply.text) - sizeof(suffix)) {
-            tlen = sizeof(reply.text) - sizeof(suffix);
+        if (tlen > sizeof(plain.text) - sizeof(suffix)) {
+            tlen = sizeof(plain.text) - sizeof(suffix);
         }
-        memcpy(reply.text, text, tlen);
-        memcpy(reply.text + tlen, suffix, sizeof(suffix));
+        memcpy(plain.text, text, tlen);
+        memcpy(plain.text + tlen, suffix, sizeof(suffix));
+        size_t plain_len = tlen + sizeof(suffix) - 1;
 
-        if (!esp_now_is_peer_exist(pkt.src)) {
-            esp_now_peer_info_t peer = { 0 };
-            memcpy(peer.peer_addr, pkt.src, sizeof(peer.peer_addr));
-            peer.channel = ESPNOW_CHANNEL;
-            peer.ifidx = WIFI_IF_STA;
-            peer.encrypt = false;
-
-            esp_err_t err = esp_now_add_peer(&peer);
-            if (err != ESP_OK) {
-                ESP_LOGE(TAG, "could not add peer " MACSTR ": %s",
-                         MAC2STR(pkt.src), esp_err_to_name(err));
-                continue;
-            }
+        secure_msg_t reply;
+        s_seq++;
+        if (crypto_seal(key, NODE_ROLE_ID, s_seq, &plain, plain_len, &reply) != ESP_OK) {
+            ESP_LOGE(TAG, "crypto_seal failed");
+            s_seq--;
+            continue;
         }
+        node_seq_save();
 
-        ESP_LOGI(TAG, "RX <- " MACSTR ": \"%s\" -> TX: %s: \"%s\"",
-                 MAC2STR(pkt.src), text, reply.name, reply.text);
+        ESP_LOGI(TAG, "TX -> " MACSTR ": %s: \"%s\" seq=%u (cifrado)",
+                 MAC2STR(pkt.src), plain.name, plain.text, (unsigned)s_seq);
 
         esp_err_t err = esp_now_send(pkt.src, (const uint8_t *)&reply, sizeof(reply));
         if (err != ESP_OK) {
@@ -487,6 +639,23 @@ static void espnow_init(void)
     peer.ifidx = WIFI_IF_STA;
     peer.encrypt = false;
     ESP_ERROR_CHECK(esp_now_add_peer(&peer));
+
+    /* Solo se activa si las 3 MACs estan configuradas en secrets.h. */
+    s_link_encryption = !mac_is_zero(MAC_TINACO) && !mac_is_zero(MAC_CISTERNA)
+                        && !mac_is_zero(MAC_BOMBA);
+    if (s_link_encryption) {
+        ESP_ERROR_CHECK(esp_now_set_pmk(ESPNOW_PMK));
+        const uint8_t *macs[3] = { MAC_TINACO, MAC_CISTERNA, MAC_BOMBA };
+        for (uint8_t id = NODE_TINACO; id <= NODE_BOMBA; id++) {
+            if (!hub_ensure_peer(macs[id - 1], id)) {
+                ESP_LOGE(TAG, "could not pre-register node %u", id);
+            }
+        }
+        ESP_LOGI(TAG, "link-layer AES-CCM enabled for 3 known peers");
+    } else {
+        ESP_LOGW(TAG, "test mode: unknown MACs, link encryption off (GCM protects payload)");
+    }
+
     ESP_ERROR_CHECK(esp_now_register_send_cb(hub_send_cb));
     ESP_ERROR_CHECK(esp_now_register_recv_cb(hub_recv_cb));
 #elif CONFIG_IDF_TARGET_ESP32C3

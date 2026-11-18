@@ -13,3 +13,6 @@ dependencies.lock
 
 # Engram local project config (nunca subir)
 .engram/
+
+# Encryption keys and node MACs (nunca subir)
+main/secrets.h

@@ -23,8 +23,10 @@
 
 /* ---- Radio tunables (heat vs. range) ---- */
 #define ESPNOW_CHANNEL   1
-/* The original demo sent every 2 s. A slower period means the node's radio
- * wakes up (and answers) far less often, which is the main source of heat. */
+/* Test bench: 10 s keeps the C3 cool. For the roof tinaco use 1 s / 250 ms
+ * from 85% and the 20 dBm value below (see the field plan). */
 #define SEND_PERIOD_MS   10000
-/* TX power in 0.25 dBm steps: 34 * 0.25 = 8.5 dBm (chip default is 20 dBm). */
-#define TX_POWER_QDBM    34
+/* TX power in 0.25 dBm steps: 34 * 0.25 = 8.5 dBm (bench, low heat).
+ * For the real tinaco link (roof + concrete slab) use 78 = 20 dBm. */
+#define TX_POWER_QDBM      34
+#define TX_POWER_QDBM_ROOF 78

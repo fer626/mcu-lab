@@ -20,6 +20,45 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Inject real keys from GitHub Secrets (if configured)
+        shell: bash
+        env:
+          ESPNOW_PMK: ${{ secrets.ESPNOW_PMK }}
+          K_TINACO: ${{ secrets.K_TINACO }}
+          K_CISTERNA: ${{ secrets.K_CISTERNA }}
+          K_BOMBA: ${{ secrets.K_BOMBA }}
+          LMK_TINACO: ${{ secrets.LMK_TINACO }}
+          LMK_CISTERNA: ${{ secrets.LMK_CISTERNA }}
+          LMK_BOMBA: ${{ secrets.LMK_BOMBA }}
+        run: |
+          python3 - <<'PY'
+          import os
+          names = ["ESPNOW_PMK", "K_TINACO", "K_CISTERNA", "K_BOMBA",
+                   "LMK_TINACO", "LMK_CISTERNA", "LMK_BOMBA"]
+          missing = [n for n in names if not os.environ.get(n)]
+          if missing:
+              print("::warning::Missing secrets: " + ", ".join(missing) +
+                    ". Building with PUBLIC dev keys (not private).")
+          else:
+              def arr(v):
+                  v = v.replace(" ", "").replace(":", "")
+                  if len(v) != 32:
+                      raise SystemExit("secret must be 32 hex chars")
+                  return "{ " + ", ".join("0x" + v[i:i+2]
+                                          for i in range(0, 32, 2)) + " }"
+              lines = ["/* Generated at build time from GitHub Secrets. */",
+                       "#pragma once", "#include <stdint.h>", ""]
+              for n in names:
+                  lines.append("static const uint8_t %s[16] = %s;" %
+                               (n, arr(os.environ[n])))
+              lines += ["", "/* MACs: unknown in test mode; fill for link-layer AES-CCM. */",
+                        "static const uint8_t MAC_TINACO[6] = {0,0,0,0,0,0};",
+                        "static const uint8_t MAC_CISTERNA[6] = {0,0,0,0,0,0};",
+                        "static const uint8_t MAC_BOMBA[6] = {0,0,0,0,0,0};"]
+              open("main/secrets.h", "w").write("\n".join(lines) + "\n")
+              print("::notice::Real keys injected into main/secrets.h")
+          PY
+
       - name: Build (${{ matrix.key }})
         uses: espressif/esp-idf-ci-action@v1
         with:
