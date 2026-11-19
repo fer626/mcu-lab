@@ -603,11 +603,13 @@ static void node_task(void *arg)
         }
         memcpy(plain.text, text, tlen);
         memcpy(plain.text + tlen, suffix, sizeof(suffix));
-        size_t plain_len = tlen + sizeof(suffix) - 1;
 
         secure_msg_t reply;
         s_seq++;
-        if (crypto_seal(key, NODE_ROLE_ID, s_seq, &plain, plain_len, &reply) != ESP_OK) {
+        /* Se cifra la estructura completa (name + text + relleno), no solo la
+         * longitud del texto: plain_t empieza por name[24], asi que un len
+         * corto cifraba el prefijo del nombre y dejaba el mensaje fuera. */
+        if (crypto_seal(key, NODE_ROLE_ID, s_seq, &plain, sizeof(plain), &reply) != ESP_OK) {
             ESP_LOGE(TAG, "crypto_seal failed");
             s_seq--;
             continue;

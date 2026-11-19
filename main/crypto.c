@@ -40,7 +40,7 @@ esp_err_t crypto_seal(const uint8_t key[16], uint8_t src, uint32_t seq,
     if (ret == 0) ret = mbedtls_gcm_update_ad(&gcm,
                                              (const uint8_t *)&aad, sizeof(aad));
     if (ret == 0) ret = mbedtls_gcm_update(&gcm, (const uint8_t *)plain, len,
-                                           out->ct, len + 15, &produced);
+                                           out->ct, sizeof(out->ct), &produced);
     if (ret == 0) ret = mbedtls_gcm_finish(&gcm, out->ct + produced,
                                            sizeof(out->ct) - produced, &tail,
                                            out->tag, NEKO_TAG_LEN);
@@ -59,6 +59,10 @@ esp_err_t crypto_open(const uint8_t key[16], const secure_msg_t *in,
     if (in->magic != 'N' || in->len > sizeof(plain_t) || in->dst != NODE_HUB) {
         return ESP_ERR_INVALID_ARG;
     }
+
+    /* auth_decrypt escribe in->len bytes: si vinieran menos de sizeof(plain_t),
+     * el resto quedaria sin inicializar. Dejamos el buffer a cero siempre. */
+    memset(out, 0, sizeof(*out));
 
     aad_t aad;
     build_aad(in, &aad);
